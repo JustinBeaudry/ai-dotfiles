@@ -1,10 +1,20 @@
 #!/bin/sh
-# Link shared skills into each agent harness and report config.
+# Link shared skills from the private checkout into each harness.
 # Does not edit MCP servers or settings files.
 set -eu
 
 ROOT="${AI_DOTFILES_HOME:-$HOME}"
 CANON="$ROOT/.agents/skills"
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname "$0")" && pwd)
+if [ -n "${AI_DOTFILES_PRIVATE:-}" ]; then
+  PRIVATE_DIR=$AI_DOTFILES_PRIVATE
+else
+  PRIVATE_DIR=$SCRIPT_DIR/../ai-dotfiles-private
+fi
+if [ -d "$PRIVATE_DIR" ]; then
+  PRIVATE_DIR=$(CDPATH= cd -- "$PRIVATE_DIR" && pwd)
+fi
+REPO_SKILLS="$PRIVATE_DIR/skills"
 
 usage() {
   cat <<'EOF'
@@ -14,11 +24,15 @@ usage: ai-dotfiles audit
 audit  Report skill links and the MCP names each harness has configured.
        Reads config files. Does not write them.
 
-link   Point Claude, Codex, Cursor, and Pi at the real skill directories
-       in ~/.agents/skills. Grok already reads that directory.
-       Existing real directories and symlinks to other places are left alone.
+link   Point ~/.agents/skills at the skill directories in the private
+       checkout (../ai-dotfiles-private by default), then point Claude,
+       Codex, Cursor, and Pi at those names. Grok already reads
+       ~/.agents/skills.
+       A home directory whose files differ from the private checkout is
+       left alone. A symlink that already points somewhere else is left alone.
 
-AI_DOTFILES_HOME overrides the home directory. Useful for a dry machine.
+AI_DOTFILES_HOME overrides the home directory and skips the private install.
+AI_DOTFILES_PRIVATE overrides the private checkout path.
 EOF
 }
 
@@ -27,9 +41,13 @@ die() {
   exit 1
 }
 
-is_link_target() {
-  name="$1"
-  dir="$CANON/$name"
+repo_mode() {
+  [ -z "${AI_DOTFILES_HOME:-}" ] || return 1
+  [ -d "$REPO_SKILLS" ]
+}
+
+skill_dir_ok() {
+  dir="$1"
   [ -L "$dir" ] && return 1
   [ -d "$dir" ] || return 1
   [ -f "$dir/SKILL.md" ] && return 0
@@ -39,16 +57,87 @@ is_link_target() {
 write_catalog() {
   catalog="$1"
   : >"$catalog"
-  [ -d "$CANON" ] || return 0
-  for dir in "$CANON"/*; do
+  if repo_mode; then
+    root="$REPO_SKILLS"
+  else
+    root="$CANON"
+  fi
+  [ -d "$root" ] || return 0
+  for dir in "$root"/*; do
     [ -e "$dir" ] || [ -L "$dir" ] || continue
     name=${dir##*/}
     case "$name" in
       .*|synced) continue ;;
     esac
-    if is_link_target "$name"; then
+    if skill_dir_ok "$dir"; then
       printf '%s\n' "$name" >>"$catalog"
     fi
+  done
+}
+
+install_one() {
+  name="$1"
+  dry="$2"
+  src="$REPO_SKILLS/$name"
+  dest="$CANON/$name"
+  case "$name" in
+    ""|.*|*/*) die "bad skill name: $name" ;;
+  esac
+
+  if same_target "$dest" "$src"; then
+    printf 'ok      canon %s\n' "$name"
+    return 0
+  fi
+  if [ -L "$dest" ] && [ ! -e "$dest" ]; then
+    if [ "$dry" = yes ]; then
+      printf 'replace canon %s (dangling symlink)\n' "$name"
+    else
+      ln -sfn "$src" "$dest"
+      printf 'linked  canon %s\n' "$name"
+    fi
+    return 0
+  fi
+  if [ -d "$dest" ] && [ ! -L "$dest" ]; then
+    if diff -rq "$src" "$dest" >/dev/null 2>&1; then
+      if [ "$dry" = yes ]; then
+        printf 'adopt   canon %s\n' "$name"
+      else
+        rm -rf "$dest"
+        ln -s "$src" "$dest"
+        printf 'adopted canon %s\n' "$name"
+      fi
+    else
+      printf 'skip    canon %s (home copy differs)\n' "$name"
+    fi
+    return 0
+  fi
+  if [ -e "$dest" ] || [ -L "$dest" ]; then
+    printf 'skip    canon %s (already exists and is not this link)\n' "$name"
+    return 0
+  fi
+  if [ "$dry" = yes ]; then
+    printf 'link    canon %s\n' "$name"
+    return 0
+  fi
+  mkdir -p "$CANON"
+  ln -s "$src" "$dest"
+  printf 'linked  canon %s\n' "$name"
+}
+
+install_from_repo() {
+  dry="$1"
+  [ -d "$REPO_SKILLS" ] || die "no skills directory at $REPO_SKILLS"
+  if [ "$dry" = no ]; then
+    mkdir -p "$CANON"
+  fi
+  for dir in "$REPO_SKILLS"/*; do
+    [ -e "$dir" ] || continue
+    name=${dir##*/}
+    case "$name" in
+      .*) continue ;;
+    esac
+    skill_dir_ok "$dir" || continue
+    install_one "$name" "$dry"
   done
 }
 
@@ -108,6 +197,12 @@ cmd_link() {
   elif [ "${1:-}" != "" ]; then
     die "unknown link option: $1"
   fi
+  if [ -z "${AI_DOTFILES_HOME:-}" ] && [ ! -d "$REPO_SKILLS" ]; then
+    die "private skills not found at $REPO_SKILLS"
+  fi
+  if repo_mode; then
+    install_from_repo "$dry"
+  fi
   [ -d "$CANON" ] || die "no skill directory at $CANON"
   catalog=$(mktemp)
   trap 'rm -f "$catalog"' EXIT INT TERM
@@ -128,6 +223,9 @@ EOF
 
 report_skills() {
   catalog="$1"
+  if repo_mode; then
+    echo "repo $REPO_SKILLS"
+  fi
   echo "canonical $CANON"
   if [ ! -d "$CANON" ]; then
     echo "  missing"
@@ -137,6 +235,9 @@ report_skills() {
   vendor=0
   for dir in "$CANON"/*; do
     [ -L "$dir" ] || continue
+    if repo_mode && same_target "$dir" "$REPO_SKILLS/${dir##*/}"; then
+      continue
+    fi
     vendor=$((vendor + 1))
   done
   count=0
