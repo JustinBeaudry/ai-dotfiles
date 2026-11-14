@@ -1,20 +1,17 @@
 #!/bin/sh
-# Link shared skills from the private checkout into each harness.
+# Link the skills in this checkout into each harness.
 # Does not edit MCP servers or settings files.
 set -eu
 
 ROOT="${AI_DOTFILES_HOME:-$HOME}"
 CANON="$ROOT/.agents/skills"
-SCRIPT_DIR=$(CDPATH= cd -- "$(dirname "$0")" && pwd)
-if [ -n "${AI_DOTFILES_PRIVATE:-}" ]; then
-  PRIVATE_DIR=$AI_DOTFILES_PRIVATE
-else
-  PRIVATE_DIR=$SCRIPT_DIR/../ai-dotfiles-private
+SCRIPT_DIR=$(CDPATH='' cd -- "$(dirname "$0")" && pwd)
+REPO_SKILLS="$SCRIPT_DIR/skills"
+LEGACY_DIR="${AI_DOTFILES_PRIVATE:-$SCRIPT_DIR/../ai-dotfiles-private}"
+if [ -d "$LEGACY_DIR" ]; then
+  LEGACY_DIR=$(CDPATH='' cd -- "$LEGACY_DIR" && pwd)
 fi
-if [ -d "$PRIVATE_DIR" ]; then
-  PRIVATE_DIR=$(CDPATH= cd -- "$PRIVATE_DIR" && pwd)
-fi
-REPO_SKILLS="$PRIVATE_DIR/skills"
+LEGACY_SKILLS="$LEGACY_DIR/skills"
 
 usage() {
   cat <<'EOF'
@@ -24,15 +21,17 @@ usage: ai-dotfiles audit
 audit  Report skill links and the MCP names each harness has configured.
        Reads config files. Does not write them.
 
-link   Point ~/.agents/skills at the skill directories in the private
-       checkout (../ai-dotfiles-private by default), then point Claude,
+link   Point ~/.agents/skills at the skill directories in this
+       checkout, then point Claude,
        Codex, Cursor, and Pi at those names. Grok already reads
        ~/.agents/skills.
-       A home directory whose files differ from the private checkout is
+       A home directory whose files differ from this checkout is
        left alone. A symlink that already points somewhere else is left alone.
+       Links to the old sibling ai-dotfiles-private checkout are migrated
+       for skills present in this repo.
 
-AI_DOTFILES_HOME overrides the home directory and skips the private install.
-AI_DOTFILES_PRIVATE overrides the private checkout path.
+AI_DOTFILES_HOME overrides the home directory.
+AI_DOTFILES_PRIVATE overrides the old checkout path for link migration only.
 EOF
 }
 
@@ -42,7 +41,6 @@ die() {
 }
 
 repo_mode() {
-  [ -z "${AI_DOTFILES_HOME:-}" ] || return 1
   [ -d "$REPO_SKILLS" ]
 }
 
@@ -86,6 +84,15 @@ install_one() {
 
   if same_target "$dest" "$src"; then
     printf 'ok      canon %s\n' "$name"
+    return 0
+  fi
+  if same_target "$dest" "$LEGACY_SKILLS/$name"; then
+    if [ "$dry" = yes ]; then
+      printf 'migrate canon %s\n' "$name"
+    else
+      ln -sfn "$src" "$dest"
+      printf 'migrated canon %s\n' "$name"
+    fi
     return 0
   fi
   if [ -L "$dest" ] && [ ! -e "$dest" ]; then
@@ -197,13 +204,11 @@ cmd_link() {
   elif [ "${1:-}" != "" ]; then
     die "unknown link option: $1"
   fi
-  if [ -z "${AI_DOTFILES_HOME:-}" ] && [ ! -d "$REPO_SKILLS" ]; then
-    die "private skills not found at $REPO_SKILLS"
-  fi
+  [ -d "$REPO_SKILLS" ] || die "skills not found at $REPO_SKILLS"
   if repo_mode; then
     install_from_repo "$dry"
   fi
-  [ -d "$CANON" ] || die "no skill directory at $CANON"
+  [ -d "$CANON" ] || [ "$dry" = yes ] || die "no skill directory at $CANON"
   catalog=$(mktemp)
   trap 'rm -f "$catalog"' EXIT INT TERM
   write_catalog "$catalog"
