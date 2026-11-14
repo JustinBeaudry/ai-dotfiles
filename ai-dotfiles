@@ -1,0 +1,359 @@
+#!/bin/sh
+# Link shared skills into each agent harness and report config.
+# Does not edit MCP servers or settings files.
+set -eu
+
+ROOT="${AI_DOTFILES_HOME:-$HOME}"
+CANON="$ROOT/.agents/skills"
+
+usage() {
+  cat <<'EOF'
+usage: ai-dotfiles audit
+       ai-dotfiles link [--dry-run]
+
+audit  Report skill links and the MCP names each harness has configured.
+       Reads config files. Does not write them.
+
+link   Point Claude, Codex, Cursor, and Pi at the real skill directories
+       in ~/.agents/skills. Grok already reads that directory.
+       Existing real directories and symlinks to other places are left alone.
+
+AI_DOTFILES_HOME overrides the home directory. Useful for a dry machine.
+EOF
+}
+
+die() {
+  printf 'ai-dotfiles: %s\n' "$1" >&2
+  exit 1
+}
+
+is_link_target() {
+  name="$1"
+  dir="$CANON/$name"
+  [ -L "$dir" ] && return 1
+  [ -d "$dir" ] || return 1
+  [ -f "$dir/SKILL.md" ] && return 0
+  find "$dir" -name SKILL.md -print | grep -q .
+}
+
+write_catalog() {
+  catalog="$1"
+  : >"$catalog"
+  [ -d "$CANON" ] || return 0
+  for dir in "$CANON"/*; do
+    [ -e "$dir" ] || [ -L "$dir" ] || continue
+    name=${dir##*/}
+    case "$name" in
+      .*|synced) continue ;;
+    esac
+    if is_link_target "$name"; then
+      printf '%s\n' "$name" >>"$catalog"
+    fi
+  done
+}
+
+destinations() {
+  printf '%s %s\n' claude "$ROOT/.claude/skills"
+  printf '%s %s\n' codex "$ROOT/.codex/skills"
+  printf '%s %s\n' cursor "$ROOT/.cursor/skills"
+  printf '%s %s\n' pi "$ROOT/.pi/agent/skills"
+}
+
+same_target() {
+  link="$1"
+  want="$2"
+  [ -L "$link" ] || return 1
+  actual=$(readlink "$link")
+  [ "$actual" = "$want" ]
+}
+
+link_one() {
+  tool="$1"
+  dest_root="$2"
+  name="$3"
+  dry="$4"
+  src="$CANON/$name"
+  dest="$dest_root/$name"
+
+  if [ -L "$dest" ] && same_target "$dest" "$src"; then
+    printf 'ok      %s %s\n' "$tool" "$name"
+    return 0
+  fi
+  if [ -L "$dest" ] && [ ! -e "$dest" ]; then
+    if [ "$dry" = yes ]; then
+      printf 'replace %s %s (dangling symlink)\n' "$tool" "$name"
+    else
+      ln -sfn "$src" "$dest"
+      printf 'linked  %s %s\n' "$tool" "$name"
+    fi
+    return 0
+  fi
+  if [ -e "$dest" ] || [ -L "$dest" ]; then
+    printf 'skip    %s %s (already exists and is not this link)\n' "$tool" "$name"
+    return 0
+  fi
+  if [ "$dry" = yes ]; then
+    printf 'link    %s %s\n' "$tool" "$name"
+    return 0
+  fi
+  mkdir -p "$dest_root"
+  ln -s "$src" "$dest"
+  printf 'linked  %s %s\n' "$tool" "$name"
+}
+
+cmd_link() {
+  dry=no
+  if [ "${1:-}" = --dry-run ]; then
+    dry=yes
+  elif [ "${1:-}" != "" ]; then
+    die "unknown link option: $1"
+  fi
+  [ -d "$CANON" ] || die "no skill directory at $CANON"
+  catalog=$(mktemp)
+  trap 'rm -f "$catalog"' EXIT INT TERM
+  write_catalog "$catalog"
+  if [ ! -s "$catalog" ]; then
+    echo "no real skill directories in $CANON"
+    return 0
+  fi
+  while read -r tool dest_root; do
+    while read -r name; do
+      [ -n "$name" ] || continue
+      link_one "$tool" "$dest_root" "$name" "$dry"
+    done <"$catalog"
+  done <<EOF
+$(destinations)
+EOF
+}
+
+report_skills() {
+  catalog="$1"
+  echo "canonical $CANON"
+  if [ ! -d "$CANON" ]; then
+    echo "  missing"
+    echo
+    return 0
+  fi
+  vendor=0
+  for dir in "$CANON"/*; do
+    [ -L "$dir" ] || continue
+    vendor=$((vendor + 1))
+  done
+  count=0
+  if [ -s "$catalog" ]; then
+    count=$(wc -l <"$catalog" | tr -d ' ')
+  fi
+  echo "  real skill directories: $count"
+  echo "  vendor or other symlinks left in place: $vendor"
+  echo "  skipped names: synced, hidden entries"
+  echo
+  while read -r tool dest_root; do
+    echo "$tool  $dest_root"
+    if [ ! -d "$dest_root" ]; then
+      echo "  directory missing"
+      echo
+      continue
+    fi
+    linked=0
+    missing=0
+    skipped=0
+    broken=0
+    while read -r name; do
+      [ -n "$name" ] || continue
+      dest="$dest_root/$name"
+      src="$CANON/$name"
+      if [ ! -e "$dest" ] && [ ! -L "$dest" ]; then
+        missing=$((missing + 1))
+        printf '  missing %s\n' "$name"
+      elif [ -L "$dest" ] && [ ! -e "$dest" ]; then
+        broken=$((broken + 1))
+        printf '  broken  %s -> %s\n' "$name" "$(readlink "$dest")"
+      elif same_target "$dest" "$src"; then
+        linked=$((linked + 1))
+      else
+        skipped=$((skipped + 1))
+        printf '  kept    %s\n' "$name"
+      fi
+    done <"$catalog"
+    for dest in "$dest_root"/*; do
+      [ -L "$dest" ] || continue
+      [ -e "$dest" ] && continue
+      name=${dest##*/}
+      if ! grep -qx "$name" "$catalog"; then
+        broken=$((broken + 1))
+        printf '  broken  %s -> %s\n' "$name" "$(readlink "$dest")"
+      fi
+    done
+    echo "  linked=$linked missing=$missing kept=$skipped broken=$broken"
+    echo
+  done <<EOF
+$(destinations)
+EOF
+  echo "grok reads $CANON directly. No skill link is written for Grok."
+  echo
+}
+
+report_configs() {
+  if ! command -v python3 >/dev/null 2>&1; then
+    echo "python3 is not on PATH. Skipped the MCP name report."
+    return 0
+  fi
+  python3 - "$ROOT" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+
+def show(path):
+    if not path.exists():
+        print(f"{path}  missing")
+        return None
+    mode = oct(path.stat().st_mode & 0o777)
+    print(f"{path}  mode={mode} bytes={path.stat().st_size}")
+    return path
+
+def names(obj):
+    if isinstance(obj, dict):
+        return sorted(obj)
+    return []
+
+print("MCP and settings are reported only. This command does not write them.")
+print()
+
+claude_json = show(root / ".claude.json")
+if claude_json is not None:
+    try:
+        data = json.loads(claude_json.read_text())
+        user = names(data.get("mcpServers"))
+        print("  user mcp:", ", ".join(user) if user else "(none)")
+        projects = data.get("projects") if isinstance(data.get("projects"), dict) else {}
+        shown = 0
+        for path, proj in sorted(projects.items()):
+            if not isinstance(proj, dict):
+                continue
+            servers = names(proj.get("mcpServers"))
+            if not servers:
+                continue
+            shown += 1
+            print(f"  project {path}: {', '.join(servers)}")
+        if shown == 0:
+            print("  projects with mcp: (none)")
+    except Exception as exc:
+        print(f"  unreadable ({type(exc).__name__})")
+print()
+
+settings = show(root / ".claude" / "settings.json")
+if settings is not None:
+    try:
+        data = json.loads(settings.read_text())
+        denied = []
+        for entry in data.get("deniedMcpServers") or []:
+            if isinstance(entry, dict) and "serverName" in entry:
+                denied.append(str(entry["serverName"]))
+        plugins = names(data.get("enabledPlugins"))
+        env = data.get("env") if isinstance(data.get("env"), dict) else {}
+        print("  denied mcp:", ", ".join(denied) if denied else "(none)")
+        print("  enabled plugins:", ", ".join(plugins) if plugins else "(none)")
+        print(f"  env entries: {len(env)} (values not shown)")
+        print("  other keys:", ", ".join(k for k in data if k not in ("env", "deniedMcpServers", "enabledPlugins")))
+    except Exception as exc:
+        print(f"  unreadable ({type(exc).__name__})")
+print()
+
+codex = show(root / ".codex" / "config.toml")
+if codex is not None:
+    try:
+        import tomllib
+        data = tomllib.loads(codex.read_text())
+        servers = data.get("mcp_servers") if isinstance(data.get("mcp_servers"), dict) else {}
+        if not servers:
+            print("  mcp: (none)")
+        for name in sorted(servers):
+            cfg = servers[name]
+            enabled = True
+            if isinstance(cfg, dict) and cfg.get("enabled") is False:
+                enabled = False
+            print(f"  mcp {name}: {'on' if enabled else 'off'}")
+        plugins = data.get("plugins") if isinstance(data.get("plugins"), dict) else {}
+        on = sum(1 for cfg in plugins.values() if isinstance(cfg, dict) and cfg.get("enabled") is not False)
+        print(f"  plugins: {on} enabled, {len(plugins) - on} disabled")
+    except Exception as exc:
+        print(f"  unreadable ({type(exc).__name__})")
+print()
+
+cursor = show(root / ".cursor" / "mcp.json")
+if cursor is not None:
+    try:
+        data = json.loads(cursor.read_text())
+        print("  live:", ", ".join(names(data.get("mcpServers"))) or "(none)")
+        print("  held aside:", ", ".join(names(data.get("disabledMcpServers"))) or "(none)")
+    except Exception as exc:
+        print(f"  unreadable ({type(exc).__name__})")
+cli = root / ".cursor" / "cli-config.json"
+if cli.exists():
+    print(f"{cli}  mode={oct(cli.stat().st_mode & 0o777)} bytes={cli.stat().st_size} (not managed)")
+print()
+
+grok = show(root / ".grok" / "config.toml")
+if grok is not None:
+    try:
+        import tomllib
+        data = tomllib.loads(grok.read_text())
+        disabled = data.get("disabled_mcp_servers") or []
+        print("  disabled mcp:", ", ".join(str(n) for n in disabled) if disabled else "(none)")
+        native = data.get("mcp_servers") if isinstance(data.get("mcp_servers"), dict) else {}
+        if native:
+            for name in sorted(native):
+                cfg = native[name]
+                enabled = not (isinstance(cfg, dict) and cfg.get("enabled") is False)
+                print(f"  native mcp {name}: {'on' if enabled else 'off'}")
+        else:
+            print("  native mcp: (none)")
+        skills = data.get("skills") if isinstance(data.get("skills"), dict) else {}
+        turned_off = skills.get("disabled") or []
+        print("  skills disabled:", ", ".join(str(n) for n in turned_off) if turned_off else "(none)")
+        plugins = data.get("plugins") if isinstance(data.get("plugins"), dict) else {}
+        enabled = plugins.get("enabled") or []
+        print("  plugins enabled:", ", ".join(str(n) for n in enabled) if enabled else "(none)")
+    except Exception as exc:
+        print(f"  unreadable ({type(exc).__name__})")
+print()
+
+print("Pi does not load MCP servers.")
+pi = show(root / ".pi" / "agent" / "settings.json")
+if pi is not None:
+    try:
+        data = json.loads(pi.read_text())
+        packages = data.get("packages") or []
+        print("  packages:", ", ".join(str(p) for p in packages) if packages else "(none)")
+    except Exception as exc:
+        print(f"  unreadable ({type(exc).__name__})")
+print()
+print("Left untouched: Claude session state, Codex config, Cursor MCP, Cursor CLI config, Grok config, Pi settings.")
+PY
+}
+
+cmd_audit() {
+  catalog=$(mktemp)
+  trap 'rm -f "$catalog"' EXIT INT TERM
+  write_catalog "$catalog"
+  echo "ai-dotfiles"
+  echo "home: $ROOT"
+  echo
+  report_skills "$catalog"
+  report_configs
+}
+
+main() {
+  cmd=${1:-}
+  shift || true
+  case "$cmd" in
+    audit) cmd_audit ;;
+    link) cmd_link "$@" ;;
+    ""|-h|--help|help) usage ;;
+    *) die "unknown command: $cmd" ;;
+  esac
+}
+
+main "$@"
